@@ -65,6 +65,77 @@ class TestParameterEfficiency(unittest.TestCase):
         self.assertEqual(lora_trainable_param_count(lora), 4 * rank * D)
 
 
+class TestBehaviorAcrossDifferentRanks(unittest.TestCase):
+    """The rank is the one knob a LoRA user actually tunes, so the
+    zero-init no-op property and the parameter-count formula both need
+    to keep holding as rank changes, not just at the one value
+    (rank=2) the other test classes happen to use."""
+
+    def test_zero_init_no_op_and_param_count_formula_hold_for_every_rank(self):
+        for rank in (1, 2, 3, 5):
+            with self.subTest(rank=rank):
+                rng = np.random.default_rng(100 + rank)
+                params = init_params(V, D, DFF, T, rng)
+                lora = init_lora(D, rank=rank, alpha=8.0, rng=rng)
+                tokens = rng.integers(0, V, size=T)
+
+                base_logits, _ = forward(params, None, tokens)
+                adapted_logits, _ = forward(params, lora, tokens)
+                np.testing.assert_array_equal(base_logits, adapted_logits)
+
+                self.assertEqual(lora_trainable_param_count(lora), 4 * rank * D)
+
+
+class TestAlphaScaling(unittest.TestCase):
+    def test_doubling_alpha_doubles_the_low_rank_update_for_fixed_a_and_b(self):
+        rng = np.random.default_rng(8)
+        params = init_params(V, D, DFF, T, rng)
+        tokens = rng.integers(0, V, size=T)
+
+        # Same A/B for both, only alpha differs -- isolates the scale
+        # factor (alpha/rank) from everything else the update depends on.
+        shared_a = rng.normal(0, 0.2, size=(2, D))
+        shared_b = rng.normal(0, 0.2, size=(D, 2))
+
+        def make_lora(alpha):
+            return {
+                "aq": shared_a,
+                "bq": shared_b,
+                "av": shared_a,
+                "bv": shared_b,
+                "rank": 2,
+                "alpha": alpha,
+            }
+
+        lora_small_alpha = make_lora(alpha=2.0)
+        lora_big_alpha = make_lora(alpha=4.0)
+
+        _, cache_small = forward(params, lora_small_alpha, tokens)
+        _, cache_big = forward(params, lora_big_alpha, tokens)
+
+        delta_small = cache_small["wq_eff"] - params["wq"]
+        delta_big = cache_big["wq_eff"] - params["wq"]
+        np.testing.assert_allclose(delta_big, 2.0 * delta_small, atol=1e-10)
+
+
+class TestReproducibility(unittest.TestCase):
+    def test_same_seed_produces_byte_identical_params_and_lora(self):
+        params_a = init_params(V, D, DFF, T, np.random.default_rng(42))
+        params_b = init_params(V, D, DFF, T, np.random.default_rng(42))
+        for key in params_a:
+            np.testing.assert_array_equal(params_a[key], params_b[key])
+
+        lora_a = init_lora(D, rank=2, alpha=4.0, rng=np.random.default_rng(42))
+        lora_b = init_lora(D, rank=2, alpha=4.0, rng=np.random.default_rng(42))
+        for key in ("aq", "bq", "av", "bv"):
+            np.testing.assert_array_equal(lora_a[key], lora_b[key])
+
+    def test_different_seeds_produce_different_params(self):
+        params_a = init_params(V, D, DFF, T, np.random.default_rng(1))
+        params_b = init_params(V, D, DFF, T, np.random.default_rng(2))
+        self.assertFalse(np.array_equal(params_a["wq"], params_b["wq"]))
+
+
 class TestFrozenBaseIsNeverMutatedByFineTuning(unittest.TestCase):
     def test_a_full_lora_training_loop_never_changes_any_base_parameter(self):
         rng = np.random.default_rng(6)
