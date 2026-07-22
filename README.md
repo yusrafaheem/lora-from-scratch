@@ -56,6 +56,88 @@ The entire forward pass, and its entire backward pass, are in
 `model.py` -- roughly 250 lines, no dependency beyond
 NumPy.
 
+## Deriving the backward pass by hand
+
+There's no autodiff anywhere in `model.py` -- every gradient in
+`loss_and_backward` is a manually-derived partial derivative, chained
+back through the forward pass op by op. Working backward from the
+loss:
+
+```
+loss = softmax_cross_entropy(logits, targets)
+dlogits = softmax(logits) - one_hot(targets)              # the one clean simplification
+dW_out, db_out = h.T @ dlogits, sum(dlogits)               # output head
+dh = dlogits @ W_out.T                                     # flows into the MLP residual
+```
+
+From there, every block is a small chain-rule exercise: the MLP's
+`linear -> ReLU -> linear` needs `dReLU = (pre_activation > 0)` masked
+against the incoming gradient; the residual connections mean the
+gradient flowing into a block's input is the *sum* of the gradient
+that skipped the block and the gradient that went through it, not
+just one or the other -- forgetting that sum is the single easiest
+way to silently get every upstream gradient wrong by a systematic
+amount.
+
+Attention is the part actually worth writing out, because it's where
+LoRA lives. With `Q = X @ W_eff_q`, `K = X @ W_k`, `V = X @ W_eff_v`,
+`scores = (Q @ K.T) / sqrt(d) + causal_mask`, `attn = softmax(scores)`,
+`out = attn @ V`, the gradient has to flow through the softmax
+Jacobian (`dscores = attn * (dattn - sum(dattn * attn, axis=-1,
+keepdims=True))`, the standard softmax-backward trick that avoids
+ever forming the full Jacobian matrix), split into `dQ` and `dK` on
+either side of the `Q @ K.T` product, and finally combine into
+`dW_eff_q = X.T @ dQ` and `dW_eff_v = X.T @ dV`.
+
+That last step is where LoRA actually enters the backward pass, and
+it's the one place a naive implementation goes wrong: `dW_eff_q` is
+the gradient with respect to the *effective* weight `W + (alpha/r) *
+B @ A`, not with respect to `W` or `A`/`B` individually. Getting from
+one to the other needs its own chain rule through the low-rank
+product: `dA = (alpha/r) * B.T @ dW_eff_q` and `dB = (alpha/r) *
+dW_eff_q @ A.T`, while `dW` itself is thrown away entirely (zeroed
+out) whenever LoRA is active, since `W` is frozen and never receives
+an update regardless of what its local gradient would have been. This
+is also exactly the split `loss_and_backward` implements: `grads['wq']`
+comes back as an all-zero array when `lora` is passed in, and the real
+signal shows up only in the separate `lora_grads['aq']`/`lora_grads['bq']`.
+
+None of this is trustworthy by inspection -- chain rules through
+softmax and low-rank products are exactly the kind of algebra that
+looks right and is subtly wrong. `test_gradients.py` is what actually
+closes the loop: every one of these hand-derived formulas is checked
+against a central-difference numerical gradient
+(`(loss(theta+eps) - loss(theta-eps)) / (2*eps)`) for every parameter
+individually, and the whole implementation only earned trust after
+every one of those checks came back under `1e-9` relative error on
+the first attempt.
+
+## Why gradient checking doesn't prove the model is correct
+
+Gradient checking answers exactly one question: does the analytic
+gradient agree with the numerical derivative of the *same* forward
+pass. That's a self-consistency check, not a semantics check. If the
+causal mask were built backwards -- masking the past instead of the
+future -- the backward pass would still gradient-check perfectly,
+because finite differences only ever ask "does nudging this weight
+change the loss the way the analytic gradient predicts." They have no
+concept of what the model is *supposed* to compute, so a
+wrong-direction mask is exactly the kind of bug that passes
+gradient checking cleanly and then silently breaks every downstream
+use of the model -- autoregressive generation most of all, since it
+depends entirely on position `t`'s output never having seen position
+`t+1`.
+
+`test_model_correctness.py` exists specifically to check the actual,
+intended semantics that gradcheck can't see: that attention weights
+to future positions are exactly zero (not just small), that a
+position can still attend to itself and the past, and -- the
+black-box version of the same property -- that changing a token at
+position `t+2` never changes the logits the model produces at
+position `t`, no matter what value that later token takes. That last
+test is the one that would have caught a backwards mask; gradient
+checking, run on this same buggy hypothetical, would not have.
+
 ## Why train on two domains
 
 A LoRA demo that only reports "loss went down" doesn't actually prove
@@ -129,23 +211,86 @@ should produce.
 
 ## Testing
 
-9 tests total, `python3 -m unittest discover -s . -p "test_*.py"`,
-plain NumPy, under a second (several use `subTest` to check every
-parameter matrix individually, so the actual number of checked
-gradients is closer to a couple hundred):
+42 tests total, `python3 -m unittest discover -s . -p "test_*.py"`,
+plain NumPy, well under a second. Five files, each aimed at a
+different layer of the implementation that could fail independently:
 
-- `test_gradients.py` -- numerical gradient checking (central
-  differences) against the analytic backward pass, for every one of
-  the ~12,000 numbers across every parameter, in both the full
+- `test_gradients.py` (4 tests) -- numerical gradient checking
+  (central differences) against the analytic backward pass, for every
+  one of the ~12,000 numbers across every parameter, in both the full
   fine-tune path (`lora=None`) and the LoRA path. This is the actual
   proof the hand-derived backward pass is correct, not just that the
-  code runs.
-- `test_lora.py` -- the properties that make LoRA useful rather
-  than just numerically correct: zero-init is a true no-op (identical
-  logits, not just close), the LoRA parameter count is a documented
+  code runs. See "Deriving the backward pass by hand" above for what
+  this is actually checking.
+- `test_model_correctness.py` (7 tests) -- the semantic properties
+  gradient checking can't see: attention weights form a valid
+  probability distribution (sum to 1, never negative), future
+  positions get exactly zero attention weight, and a black-box test
+  that a later token can never change an earlier position's logits.
+  See "Why gradient checking doesn't prove the model is correct"
+  above.
+- `test_lora.py` (9 tests) -- the properties that make LoRA useful
+  rather than just numerically correct: zero-init is a true no-op
+  (identical logits, not just close) *at every rank the project tests
+  with, not just one*, the LoRA parameter count matches a documented
   closed form (`4*r*D`) and is smaller than full fine-tuning once
-  `r << D`, and a full training loop never mutates a single frozen
-  base parameter.
+  `r << D`, doubling `alpha` exactly doubles the low-rank update for
+  fixed `A`/`B`, a full training loop never mutates a single frozen
+  base parameter, and disabling a fine-tuned adapter recovers the
+  exact pre-fine-tuning base model.
+- `test_optimizer.py` (6 tests) -- the Adam implementation and its
+  helper functions (`zero_grad_dict`, `add_into`), isolated
+  completely from the transformer and checked against a toy quadratic
+  with a known closed-form minimum, so a bug in the optimizer itself
+  can't hide behind "well, the training loss went down eventually."
+- `test_data.py` (16 tests) -- the vocabulary, both synthetic
+  domains, and the window sampler: encode/decode round-trips,
+  out-of-vocabulary characters raise instead of silently
+  mis-indexing, every decoded domain-B example is arithmetically
+  correct (`a+b=c` really does satisfy `a+b==c`), and sampled
+  `(x, y)` windows are correctly offset by exactly one character.
+
+## Implementation gotchas caught while writing these tests
+
+A few of these tests failed on the first attempt -- not because the
+underlying implementation was wrong, but because my first version of
+the *test* encoded a wrong assumption. Recording them here because
+each one is a small, real lesson about the code, not just trivia:
+
+- **`domain_a_corpus`'s length doesn't scale linearly with
+  `repeats`.** The natural first guess is `len(domain_a_corpus(repeats=3))
+  == 3 * len(domain_a_corpus(repeats=1))`. It's off by 2. The function
+  does `" ".join(SENTENCES * repeats)` -- the *whole* repeated list is
+  joined once, so the separator count is `repeats * len(SENTENCES) -
+  1`, not three independent copies of one repeat's separator count.
+  The correct relation is `len(repeats=3) == 3 * (len(repeats=1) + 1)
+  - 1`. Easy to get wrong, easy to verify once you write out what
+  `" ".join` actually does to a list that's already been multiplied.
+- **Adam's early loss values are not a reliable convergence signal.**
+  A test asserting `losses[20] < losses[0] * 0.1` failed even though
+  Adam was working correctly. Bias correction divides the raw moment
+  estimates by `(1 - beta^t)`, which is tiny for small `t` -- so
+  Adam's first several steps are deliberately conservative by design,
+  and a strict "10x smaller within 20 steps" bar fails for reasons
+  that have nothing to do with correctness. Checking a later
+  checkpoint, once warmup has passed, is the honest way to state the
+  same claim.
+- **Gradient checking cannot catch a backwards causal mask.**
+  Already covered above, but worth repeating in gotcha form: this
+  isn't a hypothetical bug this project actually had, but it's the
+  reason `test_model_correctness.py` exists as a separate file rather
+  than a couple more cases bolted onto `test_gradients.py` -- the two
+  files are checking genuinely different kinds of correctness, and
+  conflating them would have left this exact class of bug uncaught.
+- **A small-`D` test dimension can flip which fine-tuning method is
+  actually cheaper.** `TestParameterEfficiency` originally used
+  `rank=4` at the tests' `D=6`, and asserted LoRA has fewer trainable
+  parameters than full fine-tuning. It doesn't, at those dimensions --
+  `4*r*D = 4*4*6 = 96` is *more* than `2*D*D = 2*6*6 = 72`. LoRA's
+  parameter-efficiency claim depends on `r << D` holding; picking a
+  rank that isn't actually small relative to the test's toy dimension
+  silently inverts the property the test is supposed to demonstrate.
+  Fixed by dropping to `rank=2`, which is the honest comparison.
 
 ## Scope
 
