@@ -189,7 +189,7 @@ def main():
     for prompt in ["3+4=", "9+9=", "0+0=", "the "]:
         base_out = greedy_complete(params, None, prompt, max_new_chars=6)
         lora_out = greedy_complete(params, lora, prompt, max_new_chars=6)
-        print(f'  prompt {prompt!r:8s}  base: {base_out!r:16s}  lora: {lora_out!r}')
+        print(f"  prompt {prompt!r:8s}  base: {base_out!r:16s}  lora: {lora_out!r}")
 
 
 if __name__ == "__main__":
