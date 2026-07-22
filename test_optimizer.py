@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 
-from model import add_into, adam_step, init_adam_state, zero_grad_dict
+from model import adam_step, add_into, init_adam_state, zero_grad_dict
 
 
 class TestAdamOnAToyQuadratic(unittest.TestCase):
