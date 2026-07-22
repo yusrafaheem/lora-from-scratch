@@ -55,7 +55,7 @@ def domain_b_corpus(n_examples: int, rng: np.random.Generator, max_digit: int = 
     a = rng.integers(0, max_digit + 1, size=n_examples)
     b = rng.integers(0, max_digit + 1, size=n_examples)
     c = a + b
-    text = " ".join(f"{ai}+{bi}={ci}" for ai, bi, ci in zip(a, b, c))
+    text = " ".join(f"{ai}+{bi}={ci}" for ai, bi, ci in zip(a, b, c, strict=True))
     return encode(text)
 
 
